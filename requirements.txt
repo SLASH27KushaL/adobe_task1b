@@ -1,5 +1,5 @@
-pymupdf
-pymupdf4llm
-sentence-transformers
-bm25s
-nltk
+PyMuPDF==1.22.5
+sentence-transformers==2.2.2
+torch==2.0.1
+rank_bm25==0.2.2
+nltk==3.8.1

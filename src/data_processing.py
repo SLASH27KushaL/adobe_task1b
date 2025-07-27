@@ -1,103 +1,93 @@
-# src/data_processing.py
-
 import os
-import fitz
-import pymupdf4llm
+import json
 from typing import List, Dict
+import fitz  # PyMuPDF
 
+Section = Dict[str, any]
 
-def extract_sections_from_pdf(pdf_path: str) -> List[Dict]:
+def load_outline_json(json_path: str) -> List[Section]:
     """
-    Extracts sections and subsections from a PDF using pymupdf4llm Markdown.
-    Falls back to splitting full text into paragraph chunks if no headings.
-    Returns list of dicts: title, text, page, subsections.
+    Read a flat outline JSON (list of {level, text, page})
+    and build nested Section objects:
+      - Each H1 becomes a top-level section
+      - H2s attach under the most recent H1
+      - H3s attach under the most recent H2
     """
-    # Try structured Markdown extraction
-    try:
-        md = pymupdf4llm.to_markdown(pdf_path)
-        lines = md.splitlines()
-    except Exception:
-        lines = []
+    data = json.load(open(json_path, encoding="utf-8"))
+    flat = data.get("outline", [])
+    sections: List[Section] = []
 
-    sections: List[Dict] = []
-    current_sec: Dict = {'title': None, 'text': '', 'page': None, 'subsections': []}
-    current_sub: Dict = None
+    for entry in flat:
+        lvl = entry.get("level")
+        txt = entry.get("text", "").strip()
+        pg = entry.get("page")
 
-    # Parse headings (# section, ## subsection)
-    for line in lines:
-        if line.startswith('# '):
-            if current_sec['title']:
-                if current_sub:
-                    current_sec['subsections'].append(current_sub)
-                    current_sub = None
-                sections.append(current_sec)
-            current_sec = {'title': line[2:].strip(), 'text': '', 'page': None, 'subsections': []}
-        elif line.startswith('## '):
-            if current_sub:
-                current_sec['subsections'].append(current_sub)
-            current_sub = {'title': line[3:].strip(), 'text': '', 'page': None}
-        else:
-            target = current_sub if current_sub else current_sec
-            target['text'] += line + '\n'
-
-    # Append last parsed section
-    if current_sec.get('title'):
-        if current_sub:
-            current_sec['subsections'].append(current_sub)
-        sections.append(current_sec)
-
-    # Open PDF for fallback & page mapping
-    doc = fitz.open(pdf_path)
-
-    # Fallback: if no headings parsed, split full text into paragraph chunks
-    if not sections:
-        full_text = ''
-        for page in doc:
-            full_text += page.get_text('text') + '\n'
-        # Split into paragraphs by double newlines
-        paras = [p.strip() for p in full_text.split('\n\n') if p.strip()]
-        # Create single section with paragraph subsections
-        fallback_sec = {
-            'title': os.path.basename(pdf_path),
-            'text': '',
-            'page': 0,
-            'subsections': []
-        }
-        for i, para in enumerate(paras, 1):
-            fallback_sec['subsections'].append({
-                'title': f"Paragraph {i}",
-                'text': para,
-                'page': 0
+        if lvl == "H1":
+            sections.append({
+                "document": os.path.basename(json_path).replace("_outline.json", ".pdf"),
+                "heading": txt,
+                "level": lvl,
+                "page": pg,
+                "text": "",            # to fill from PDF
+                "subsections": []
             })
-        return [fallback_sec]
-
-    # Map section titles to page numbers
-    for sec in sections:
-        for page in doc:
-            if sec['title'] and page.search_for(sec['title']):
-                sec['page'] = page.number
-                break
-        for sub in sec['subsections']:
-            for page in doc:
-                if sub['title'] and page.search_for(sub['title']):
-                    sub['page'] = page.number
-                    break
+        elif lvl == "H2" and sections:
+            sections[-1]["subsections"].append({
+                "document": sections[-1]["document"],
+                "heading": txt,
+                "level": lvl,
+                "page": pg,
+                "text": "",
+                "subsections": []
+            })
+        elif lvl == "H3" and sections and sections[-1]["subsections"]:
+            sections[-1]["subsections"][-1]["subsections"].append({
+                "document": sections[-1]["document"],
+                "heading": txt,
+                "level": lvl,
+                "page": pg,
+                "text": ""
+            })
 
     return sections
 
 
-def extract_sections_from_folder(folder_path: str) -> List[Dict]:
+def extract_sections_from_folder(folder_path: str) -> List[Section]:
     """
-    Process all PDF files in a folder and extract sections.
-    Annotates each section with its source document filename.
+    For every *_outline.json in folder_path/docs:
+      1. Load the nested outline via load_outline_json()
+      2. Open the matching PDF and extract each page’s full text
+         into the corresponding section/subsection.
+    Returns a flat list of all sections (with subsections nested).
     """
-    all_secs: List[Dict] = []
-    for fname in sorted(os.listdir(folder_path)):
-        if not fname.lower().endswith('.pdf'):
+    all_secs: List[Section] = []
+    docs_dir = os.path.join(folder_path, "docs")
+
+    for fname in sorted(os.listdir(docs_dir)):
+        if not fname.endswith("_outline.json"):
             continue
-        path = os.path.join(folder_path, fname)
-        secs = extract_sections_from_pdf(path)
-        for sec in secs:
-            sec['document'] = fname
-        all_secs.extend(secs)
+
+        outline_path = os.path.join(docs_dir, fname)
+        sections = load_outline_json(outline_path)
+
+        # Open PDF once per outline
+        pdf_name = fname.replace("_outline.json", ".pdf")
+        pdf_path = os.path.join(docs_dir, pdf_name)
+        pdf = fitz.open(pdf_path)
+
+        # Fill in text for each section & subsection
+        for sec in sections:
+            try:
+                sec["text"] = pdf[sec["page"] - 1].get_text("text")
+            except Exception:
+                sec["text"] = ""
+            for sub in sec["subsections"]:
+                try:
+                    sub["text"] = pdf[sub["page"] - 1].get_text("text")
+                except Exception:
+                    sub["text"] = ""
+                # H3 nesting can be handled similarly if needed
+
+        all_secs.extend(sections)
+
     return all_secs
